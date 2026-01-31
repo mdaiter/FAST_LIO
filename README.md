@@ -46,15 +46,15 @@ Plus a **fused pipeline** (`fused_h_share_model`) that chains kernels 1-6 keepin
 
 ### Performance (Apple M3 Pro)
 
-**Fused h_share_model pipeline** (the real-world target, end-to-end):
+**Fused h_share_model pipeline** (superkernel — 2 GPU dispatches, end-to-end):
 
 | Points | CPU | Metal | Speedup |
 |--------|-----|-------|---------|
-| 1,000 | 0.41 ms | 0.24 ms | **1.8x** |
-| 5,000 | 2.1 ms | 0.51 ms | **4.1x** |
-| 10,000 | 4.1 ms | 0.76 ms | **5.4x** |
-| 50,000 | 20.5 ms | 2.8 ms | **7.3x** |
-| 100,000 | 41.1 ms | 5.5 ms | **7.4x** |
+| 1,000 | 0.41 ms | 0.077 ms | **5.3x** |
+| 5,000 | 2.0 ms | 0.16 ms | **12.8x** |
+| 10,000 | 4.1 ms | 0.25 ms | **16.5x** |
+| 50,000 | 20.2 ms | 0.88 ms | **23.1x** |
+| 100,000 | 40.3 ms | 1.79 ms | **22.5x** |
 
 **Isolated plane fitting** (the single biggest bottleneck kernel):
 

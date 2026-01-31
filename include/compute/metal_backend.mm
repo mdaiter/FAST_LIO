@@ -72,6 +72,17 @@ struct UndistortParams {
     uint32_t num_segments;
 };
 
+struct FusedParams {
+    float R_body[9];
+    float t_body[3];
+    float R_ext[9];
+    float t_ext[3];
+    uint32_t n;
+    uint32_t k;
+    float plane_threshold;
+    uint32_t extrinsic_est_en;
+};
+
 static_assert(sizeof(PlaneCoeffsGPU) == 20, "PlaneCoeffsGPU size mismatch with GPU");
 
 namespace fastlio {
@@ -118,9 +129,12 @@ public:
             pso_hth_partial_   = make_pso(@"hth_partial");
             pso_hth_vec_       = make_pso(@"hth_partial_vec");
             pso_undistort_     = make_pso(@"undistort_points");
+            pso_fused_         = make_pso(@"fused_h_share");
+            pso_hth_combined_  = make_pso(@"hth_combined_partial");
 
             if (!pso_transform_ || !pso_plane_fit_ || !pso_residuals_ ||
-                !pso_jacobian_ || !pso_hth_partial_ || !pso_hth_vec_ || !pso_undistort_) {
+                !pso_jacobian_ || !pso_hth_partial_ || !pso_hth_vec_ || !pso_undistort_ ||
+                !pso_fused_ || !pso_hth_combined_) {
                 NSLog(@"Metal: Failed to create one or more pipeline states");
                 device_ = nil;
                 return;
@@ -411,7 +425,7 @@ public:
         }
     }
 
-    // ─── Fused pipeline ──────────────────────────────────────────────
+    // ─── Fused pipeline (superkernel + combined reduction) ─────────
 
     HShareModelResult fused_h_share_model(
         const float* points_body_host, const float* neighbors_host,
@@ -422,84 +436,99 @@ public:
         @autoreleasepool {
             // Allocate GPU buffers
             BufferHandle b_pb = alloc(n * 3 * sizeof(float));
-            BufferHandle b_pw = alloc(n * 3 * sizeof(float));
-            BufferHandle b_nb = alloc(n * k * 3 * sizeof(float));
-            BufferHandle b_planes = alloc(n * sizeof(PlaneCoeffsGPU));
-            BufferHandle b_res = alloc(n * sizeof(float));
-            BufferHandle b_valid = alloc(n * sizeof(uint8_t));
+            BufferHandle b_nb = alloc((size_t)n * k * 3 * sizeof(float));
+            BufferHandle b_H  = alloc(n * 12 * sizeof(float));  // N x 12 float (invalid → zero)
+            BufferHandle b_h  = alloc(n * sizeof(float));        // N float
 
             upload(b_pb, points_body_host, n * 3 * sizeof(float));
-            upload(b_nb, neighbors_host, n * k * 3 * sizeof(float));
+            upload(b_nb, neighbors_host, (size_t)n * k * 3 * sizeof(float));
 
-            // Step 1: Transform
-            batch_transform_points(b_pw, b_pb, n, body_to_world, lidar_to_imu);
+            // ── Single fused dispatch: transform + plane_fit + residual + jacobian ──
+            FusedParams fparams;
+            rt_to_float(body_to_world, fparams.R_body, fparams.t_body);
+            rt_to_float(lidar_to_imu, fparams.R_ext, fparams.t_ext);
+            fparams.n = (uint32_t)n;
+            fparams.k = (uint32_t)k;
+            fparams.plane_threshold = plane_threshold;
+            fparams.extrinsic_est_en = extrinsic_est_en ? 1 : 0;
 
-            // Step 2: Plane fit
-            batch_plane_fit(b_planes, b_nb, n, k, plane_threshold);
+            dispatch_kernel(pso_fused_, n,
+                {mtl_buf(b_pb), mtl_buf(b_nb), mtl_buf(b_H), mtl_buf(b_h)},
+                &fparams, sizeof(fparams));
 
-            // Step 3: Residuals
-            batch_compute_residuals(b_res, b_valid, b_pw, b_pb, b_planes, n);
+            // ── Combined HTH + HTh reduction ──
+            uint32_t group_size = 256;
+            uint32_t num_groups = ((uint32_t)n + group_size - 1) / group_size;
 
-            // Read back for compaction (GPU stream compaction would be better but complex)
-            std::vector<uint8_t> valid_mask(n);
-            std::vector<float> residuals(n);
-            download(valid_mask.data(), b_valid, n * sizeof(uint8_t));
-            download(residuals.data(), b_res, n * sizeof(float));
+            BufferHandle b_partials_hth = alloc(num_groups * 78 * sizeof(float));
+            BufferHandle b_partials_hth_vec = alloc(num_groups * 12 * sizeof(float));
 
-            // Read plane coefficients for normals
-            std::vector<PlaneCoeffsGPU> planes_gpu(n);
-            download(planes_gpu.data(), b_planes, n * sizeof(PlaneCoeffsGPU));
+            HTHParams hparams;
+            hparams.m = (uint32_t)n;
 
-            // Compact
+            dispatch_kernel_groups(pso_hth_combined_, num_groups, group_size,
+                {mtl_buf(b_H), mtl_buf(b_h),
+                 mtl_buf(b_partials_hth), mtl_buf(b_partials_hth_vec)},
+                &hparams, sizeof(hparams));
+
+            // ── CPU final reduction ──
             HShareModelResult result;
+
+            // HTH
+            const float* phth = (const float*)[mtl_buf(b_partials_hth) contents];
+            float hth_sum[78] = {};
+            for (uint32_t g = 0; g < num_groups; g++)
+                for (int i = 0; i < 78; i++)
+                    hth_sum[i] += phth[g * 78 + i];
+
+            memset(result.HTH, 0, sizeof(result.HTH));
+            int idx = 0;
+            for (int i = 0; i < 12; i++)
+                for (int j = i; j < 12; j++) {
+                    result.HTH[j*12+i] = (double)hth_sum[idx];
+                    result.HTH[i*12+j] = (double)hth_sum[idx];
+                    idx++;
+                }
+
+            // HTh
+            const float* phthv = (const float*)[mtl_buf(b_partials_hth_vec) contents];
+            for (int i = 0; i < 12; i++) {
+                double sum = 0;
+                for (uint32_t g = 0; g < num_groups; g++)
+                    sum += (double)phthv[g * 12 + i];
+                result.HTh[i] = sum;
+            }
+
+            // ── Count valid features + extract compacted results ──
+            // Read back h_out: non-zero h means valid point
+            const float* h_data = (const float*)[mtl_buf(b_h) contents];
+            const float* H_data = (const float*)[mtl_buf(b_H) contents];
+
             result.effct_feat_num = 0;
             std::vector<float> compact_pb, compact_normals, compact_dists;
 
             for (int i = 0; i < n; i++) {
-                if (valid_mask[i]) {
+                // Check if this point produced a non-zero H row
+                // (valid points have non-zero normal in cols 0-2)
+                const float* row = H_data + i * 12;
+                if (row[0] != 0.0f || row[1] != 0.0f || row[2] != 0.0f) {
                     compact_pb.push_back(points_body_host[i*3+0]);
                     compact_pb.push_back(points_body_host[i*3+1]);
                     compact_pb.push_back(points_body_host[i*3+2]);
-                    compact_normals.push_back(planes_gpu[i].a);
-                    compact_normals.push_back(planes_gpu[i].b);
-                    compact_normals.push_back(planes_gpu[i].c);
-                    compact_dists.push_back(residuals[i]);
+                    compact_normals.push_back(row[0]);
+                    compact_normals.push_back(row[1]);
+                    compact_normals.push_back(row[2]);
+                    compact_dists.push_back(-h_data[i]);  // h = -residual
                     result.effct_feat_num++;
                 }
-            }
-
-            int m = result.effct_feat_num;
-
-            if (m > 0) {
-                BufferHandle b_H = alloc(m * 12 * sizeof(double));
-                BufferHandle b_h = alloc(m * sizeof(double));
-                BufferHandle b_cpb = alloc(m * 3 * sizeof(float));
-                BufferHandle b_cn = alloc(m * 3 * sizeof(float));
-                BufferHandle b_cd = alloc(m * sizeof(float));
-
-                upload(b_cpb, compact_pb.data(), m * 3 * sizeof(float));
-                upload(b_cn, compact_normals.data(), m * 3 * sizeof(float));
-                upload(b_cd, compact_dists.data(), m * sizeof(float));
-
-                batch_build_jacobian(b_H, b_h, b_cpb, b_cn, b_cd, m,
-                                     body_to_world.R, lidar_to_imu.R, lidar_to_imu.t,
-                                     extrinsic_est_en);
-
-                compute_HTH(result.HTH, b_H, m);
-                compute_HTh(result.HTh, b_H, b_h, m);
-
-                free(b_H); free(b_h); free(b_cpb); free(b_cn); free(b_cd);
-            } else {
-                memset(result.HTH, 0, sizeof(result.HTH));
-                memset(result.HTh, 0, sizeof(result.HTh));
             }
 
             result.valid_points_body = std::move(compact_pb);
             result.valid_normals = std::move(compact_normals);
             result.valid_residuals = std::move(compact_dists);
 
-            free(b_pb); free(b_pw); free(b_nb);
-            free(b_planes); free(b_res); free(b_valid);
+            free(b_pb); free(b_nb); free(b_H); free(b_h);
+            free(b_partials_hth); free(b_partials_hth_vec);
 
             return result;
         }
@@ -517,6 +546,8 @@ private:
     id<MTLComputePipelineState> pso_hth_partial_ = nil;
     id<MTLComputePipelineState> pso_hth_vec_ = nil;
     id<MTLComputePipelineState> pso_undistort_ = nil;
+    id<MTLComputePipelineState> pso_fused_ = nil;
+    id<MTLComputePipelineState> pso_hth_combined_ = nil;
 
     struct BufferInfo {
         id<MTLBuffer> buffer;
