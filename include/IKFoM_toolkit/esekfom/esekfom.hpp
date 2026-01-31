@@ -86,6 +86,15 @@ struct dyn_share_datastruct
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_v;
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_x;
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> R;
+
+	// ─── GPU acceleration: pre-computed H^T*H and H^T*h ─────────
+	// When use_precomputed_HTH is true, the ESKF uses these directly
+	// instead of computing h_x^T * h_x and h_x^T * h from scratch.
+	// This avoids transferring the large M×12 Jacobian matrix from GPU.
+	bool use_precomputed_HTH = false;
+	int  precomputed_dof_Measurement = 0;
+	Eigen::Matrix<T, 12, 12> HTH_precomputed;    // H^T * H (12×12)
+	Eigen::Matrix<T, 12, 1>  HTh_precomputed;    // H^T * h (12×1)
 };
 
 //used for iterated error state EKF update
@@ -1644,10 +1653,15 @@ public:
 			#ifdef USE_sparse
 				spMt h_x_ = dyn_share.h_x.sparseView();
 			#else
-				Eigen::Matrix<scalar_type, Eigen::Dynamic, 12> h_x_ = dyn_share.h_x;
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, 12> h_x_;
+				if (!dyn_share.use_precomputed_HTH) {
+					h_x_ = dyn_share.h_x;
+				}
 			#endif
 			double solve_start = omp_get_wtime();
-			dof_Measurement = h_x_.rows();
+			dof_Measurement = dyn_share.use_precomputed_HTH
+				? dyn_share.precomputed_dof_Measurement
+				: h_x_.rows();
 			vectorized_state dx;
 			x_.boxminus(dx, x_propagated);
 			dx_new = dx;
@@ -1714,10 +1728,10 @@ public:
 
 			if(n > dof_Measurement)
 			{
-			//#ifdef USE_sparse
-				//Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> K_temp = h_x * P_ * h_x.transpose();
-				//spMt R_temp = h_v * R_ * h_v.transpose();
-				//K_temp += R_temp;
+				// NOTE: This path requires the full H matrix and cannot use
+				// pre-computed HTH/HTh. This is only reached when dof_Measurement < 24,
+				// which means fewer than 24 valid features — extremely rare in practice
+				// (h_share_model returns early if effct_feat_num < 1).
 				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur = Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
 				h_x_cur.topLeftCorner(dof_Measurement, 12) = h_x_;
 				/*
@@ -1780,34 +1794,22 @@ public:
 				*/
 			#else
 				cov P_temp = (P_/R).inverse();
-				//Eigen::Matrix<scalar_type, 12, Eigen::Dynamic> h_T = h_x_.transpose();
-				Eigen::Matrix<scalar_type, 12, 12> HTH = h_x_.transpose() * h_x_; 
+				Eigen::Matrix<scalar_type, 12, 12> HTH;
+				Eigen::Matrix<scalar_type, 12, 1> HTh;
+				if (dyn_share.use_precomputed_HTH) {
+					// GPU path: use pre-computed H^T*H and H^T*h directly
+					HTH = dyn_share.HTH_precomputed;
+					HTh = dyn_share.HTh_precomputed;
+				} else {
+					// CPU path: compute from full Jacobian matrix
+					HTH = h_x_.transpose() * h_x_;
+					HTh = h_x_.transpose() * dyn_share.h;
+				}
 				P_temp. template block<12, 12>(0, 0) += HTH;
-				/*
-				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur = Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
-				//std::cout << "line 1767" << std::endl;
-				h_x_cur.col(0) = h_x_.col(0);
-				h_x_cur.col(1) = h_x_.col(1);
-				h_x_cur.col(2) = h_x_.col(2);
-				h_x_cur.col(3) = h_x_.col(3);
-				h_x_cur.col(4) = h_x_.col(4);
-				h_x_cur.col(5) = h_x_.col(5);
-				h_x_cur.col(6) = h_x_.col(6);
-				h_x_cur.col(7) = h_x_.col(7);
-				h_x_cur.col(8) = h_x_.col(8);
-				h_x_cur.col(9) = h_x_.col(9);
-				h_x_cur.col(10) = h_x_.col(10);
-				h_x_cur.col(11) = h_x_.col(11);
-				*/
 				cov P_inv = P_temp.inverse();
-				//std::cout << "line 1781" << std::endl;
-				K_h = P_inv. template block<n, 12>(0, 0) * h_x_.transpose() * dyn_share.h;
-				//std::cout << "line 1780" << std::endl;
-				//cov HTH_cur = cov::Zero();
-				//HTH_cur. template block<12, 12>(0, 0) = HTH;
-				K_x.setZero(); // = cov::Zero();
+				K_h = P_inv. template block<n, 12>(0, 0) * HTh;
+				K_x.setZero();
 				K_x. template block<n, 12>(0, 0) = P_inv. template block<n, 12>(0, 0) * HTH;
-				//K_= (h_x_.transpose() * h_x_ + (P_/R).inverse()).inverse()*h_x_.transpose();
 			#endif 
 			}
 

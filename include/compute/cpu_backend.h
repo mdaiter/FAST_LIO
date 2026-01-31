@@ -522,7 +522,7 @@ private:
 
 // ─── Factory implementations (CPU-only, when no GPU backend is linked) ───
 
-#ifndef HAS_METAL
+#if !defined(HAS_METAL) && !defined(HAS_CUDA)
 inline std::unique_ptr<ComputeBackend> create_backend(const std::string& name) {
     if (name == "cpu" || name == "CPU") {
         return std::make_unique<CPUBackend>();

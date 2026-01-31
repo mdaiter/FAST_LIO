@@ -96,6 +96,32 @@ if(NOT HAS_METAL)
 endif()
 
 # ──────────────────────────────────────────────
+# CUDA Backend (Linux / Windows with NVIDIA GPU)
+# ──────────────────────────────────────────────
+set(HAS_CUDA OFF)
+if(NOT HAS_METAL)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(HAS_CUDA ON)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+    set(CUDA_BACKEND_SRCS
+      "${FAST_LIO_ROOT}/include/compute/cuda/cuda_backend.cu"
+      "${FAST_LIO_ROOT}/include/compute/cuda/kernels.cu"
+    )
+
+    message(STATUS "CUDA GPU backend: ENABLED (${CMAKE_CUDA_COMPILER})")
+  else()
+    message(STATUS "CUDA GPU backend: DISABLED (no CUDA compiler found)")
+  endif()
+else()
+  message(STATUS "CUDA GPU backend: DISABLED (Metal backend active)")
+endif()
+
+# ──────────────────────────────────────────────
 # Unit Tests
 # ──────────────────────────────────────────────
 enable_testing()
@@ -160,5 +186,29 @@ if(HAS_METAL)
   target_compile_definitions(bench_metal_backend PRIVATE HAS_METAL=1)
   set_source_files_properties(${METAL_BACKEND_SRC} PROPERTIES
     COMPILE_FLAGS "-fobjc-arc"
+  )
+endif()
+
+# ──────────────────────────────────────────────
+# CUDA Tests & Benchmarks (if available)
+# ──────────────────────────────────────────────
+if(HAS_CUDA)
+  # Test: CUDA compute backend
+  add_executable(test_cuda_backend test_cuda_backend.cpp ${CUDA_BACKEND_SRCS})
+  target_link_libraries(test_cuda_backend GTest::gtest_main Eigen3::Eigen)
+  target_compile_definitions(test_cuda_backend PRIVATE HAS_CUDA=1)
+  set_target_properties(test_cuda_backend PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "60;70;75;80;86;89;90"
+  )
+  gtest_discover_tests(test_cuda_backend PROPERTIES TIMEOUT 60)
+
+  # Benchmark: CUDA backend vs CPU
+  add_executable(bench_cuda_backend bench_cuda_backend.cpp ${CUDA_BACKEND_SRCS})
+  target_link_libraries(bench_cuda_backend benchmark::benchmark Eigen3::Eigen)
+  target_compile_definitions(bench_cuda_backend PRIVATE HAS_CUDA=1)
+  set_target_properties(bench_cuda_backend PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "60;70;75;80;86;89;90"
   )
 endif()

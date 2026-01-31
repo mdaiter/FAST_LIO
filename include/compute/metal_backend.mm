@@ -579,6 +579,15 @@ private:
 
     NSString* find_metallib() {
         // Try several paths:
+
+        // 0. CMake-defined path (set via target_compile_definitions)
+        #ifdef METALLIB_PATH
+        {
+            NSString* path = @METALLIB_PATH;
+            if ([[NSFileManager defaultManager] fileExistsAtPath:path]) return path;
+        }
+        #endif
+
         // 1. Next to the executable
         NSString* execPath = [[NSProcessInfo processInfo] arguments][0];
         NSString* execDir = [execPath stringByDeletingLastPathComponent];
