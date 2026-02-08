@@ -60,6 +60,10 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
+#ifdef USE_GPU_BACKEND
+#include <compute/cpu_backend.h>   // includes compute_backend.h
+#endif
+
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
@@ -118,6 +122,10 @@ pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
 KD_TREE<PointType> ikdtree;
+
+#ifdef USE_GPU_BACKEND
+std::unique_ptr<fastlio::compute::ComputeBackend> gpu_backend;
+#endif
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
 V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
@@ -635,7 +643,7 @@ void publish_path(const ros::Publisher pubPath)
     }
 }
 
-void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+void h_share_model_cpu(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
     laserCloudOri->clear(); 
@@ -753,6 +761,177 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+#ifdef USE_GPU_BACKEND
+void h_share_model_gpu(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+{
+    double match_start = omp_get_wtime();
+    total_residual = 0.0;
+
+    // ─── Phase 1: Transform points to world frame + k-NN search (CPU) ───
+    // The ikd-tree is a CPU-resident pointer-based structure, so k-NN
+    // search cannot be accelerated. We parallelize it with OpenMP.
+    #ifdef MP_EN
+        omp_set_num_threads(MP_PROC_NUM);
+        #pragma omp parallel for
+    #endif
+    for (int i = 0; i < feats_down_size; i++)
+    {
+        PointType &point_body  = feats_down_body->points[i];
+        PointType &point_world = feats_down_world->points[i];
+
+        V3D p_body(point_body.x, point_body.y, point_body.z);
+        V3D p_global(s.rot * (s.offset_R_L_I * p_body + s.offset_T_L_I) + s.pos);
+        point_world.x = p_global(0);
+        point_world.y = p_global(1);
+        point_world.z = p_global(2);
+        point_world.intensity = point_body.intensity;
+
+        vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+        auto &points_near = Nearest_Points[i];
+
+        if (ekfom_data.converge)
+        {
+            ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+            point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
+        }
+    }
+
+    // ─── Phase 2: Pack data for GPU ─────────────────────────────────────
+    // Count valid points (those that passed k-NN filter) and pack their
+    // body-frame coords + neighbor coords into flat arrays.
+    int n_valid = 0;
+    for (int i = 0; i < feats_down_size; i++) {
+        if (point_selected_surf[i]) n_valid++;
+    }
+
+    if (n_valid < 1) {
+        ekfom_data.valid = false;
+        ROS_WARN("No Effective Points (GPU path)! \n");
+        return;
+    }
+
+    // Pack body points and neighbors into flat arrays for the GPU.
+    // Only include points that passed the k-NN distance filter.
+    std::vector<float> packed_body(n_valid * 3);
+    std::vector<float> packed_neighbors(n_valid * NUM_MATCH_POINTS * 3);
+
+    int idx = 0;
+    for (int i = 0; i < feats_down_size; i++) {
+        if (!point_selected_surf[i]) continue;
+
+        const PointType &pb = feats_down_body->points[i];
+        packed_body[idx * 3 + 0] = pb.x;
+        packed_body[idx * 3 + 1] = pb.y;
+        packed_body[idx * 3 + 2] = pb.z;
+
+        const auto &neighbors = Nearest_Points[i];
+        for (int j = 0; j < NUM_MATCH_POINTS; j++) {
+            packed_neighbors[(idx * NUM_MATCH_POINTS + j) * 3 + 0] = neighbors[j].x;
+            packed_neighbors[(idx * NUM_MATCH_POINTS + j) * 3 + 1] = neighbors[j].y;
+            packed_neighbors[(idx * NUM_MATCH_POINTS + j) * 3 + 2] = neighbors[j].z;
+        }
+        idx++;
+    }
+
+    // ─── Phase 3: Build transforms for the GPU ──────────────────────────
+    using fastlio::compute::RigidTransform;
+
+    // Body-to-world: p_world = R_b2w * p_imu + t_b2w
+    //   where p_imu = R_l2i * p_body + t_l2i
+    // The fused kernel handles both stages internally.
+    RigidTransform body_to_world;
+    {
+        Eigen::Matrix3d R = s.rot.toRotationMatrix();
+        // column-major: store as-is since Eigen is column-major
+        Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::ColMajor>>(body_to_world.R) = R;
+        Eigen::Map<Eigen::Vector3d>(body_to_world.t) = s.pos;
+    }
+
+    RigidTransform lidar_to_imu;
+    {
+        Eigen::Matrix3d R = s.offset_R_L_I.toRotationMatrix();
+        Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::ColMajor>>(lidar_to_imu.R) = R;
+        Eigen::Map<Eigen::Vector3d>(lidar_to_imu.t) = s.offset_T_L_I;
+    }
+
+    match_time += omp_get_wtime() - match_start;
+    double solve_start_ = omp_get_wtime();
+
+    // ─── Phase 4: GPU fused pipeline ────────────────────────────────────
+    // This single call does: transform → plane fit → residual filter →
+    // Jacobian → HTH/HTh reduction, all on device.
+    auto result = gpu_backend->fused_h_share_model(
+        packed_body.data(),
+        packed_neighbors.data(),
+        n_valid,
+        NUM_MATCH_POINTS,
+        body_to_world,
+        lidar_to_imu,
+        0.1f,             // plane_threshold (same as esti_plane)
+        extrinsic_est_en
+    );
+
+    effct_feat_num = result.effct_feat_num;
+
+    if (effct_feat_num < 1) {
+        ekfom_data.valid = false;
+        ROS_WARN("No Effective Points (GPU fused pipeline)! \n");
+        return;
+    }
+
+    // Compute total residual for logging
+    for (int i = 0; i < effct_feat_num; i++) {
+        total_residual += std::fabs(result.valid_residuals[i]);
+    }
+    res_mean_last = total_residual / effct_feat_num;
+
+    // ─── Phase 5: Pass pre-computed HTH/HTh to ESKF ─────────────────────
+    // Instead of building the full M×12 Jacobian matrix and letting the
+    // ESKF compute H^T*H and H^T*h, we pass them directly from the GPU.
+    ekfom_data.use_precomputed_HTH = true;
+    ekfom_data.precomputed_dof_Measurement = effct_feat_num;
+
+    // Copy 12×12 HTH (column-major double)
+    Eigen::Map<const Eigen::Matrix<double, 12, 12, Eigen::ColMajor>> hth_map(result.HTH);
+    ekfom_data.HTH_precomputed = hth_map;
+
+    // Copy 12×1 HTh
+    Eigen::Map<const Eigen::Matrix<double, 12, 1>> hth_vec_map(result.HTh);
+    ekfom_data.HTh_precomputed = hth_vec_map;
+
+    // Also populate laserCloudOri and corr_normvect for map update and visualization
+    laserCloudOri->clear();
+    corr_normvect->clear();
+    for (int i = 0; i < effct_feat_num; i++) {
+        PointType pt;
+        pt.x = result.valid_points_body[i * 3 + 0];
+        pt.y = result.valid_points_body[i * 3 + 1];
+        pt.z = result.valid_points_body[i * 3 + 2];
+        laserCloudOri->push_back(pt);
+
+        PointType nm;
+        nm.x = result.valid_normals[i * 3 + 0];
+        nm.y = result.valid_normals[i * 3 + 1];
+        nm.z = result.valid_normals[i * 3 + 2];
+        nm.intensity = result.valid_residuals[i];
+        corr_normvect->push_back(nm);
+    }
+
+    solve_time += omp_get_wtime() - solve_start_;
+}
+#endif // USE_GPU_BACKEND
+
+void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+{
+#ifdef USE_GPU_BACKEND
+    if (gpu_backend) {
+        h_share_model_gpu(s, ekfom_data);
+        return;
+    }
+#endif
+    h_share_model_cpu(s, ekfom_data);
+}
+
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
@@ -825,6 +1004,19 @@ int main(int argc, char** argv)
     p_imu->lidar_type = lidar_type;
     double epsi[23] = {0.001};
     fill(epsi, epsi+23, 0.001);
+
+    // ─── Initialize GPU compute backend ─────────────────────────────────
+    #ifdef USE_GPU_BACKEND
+    {
+        gpu_backend = fastlio::compute::create_default_backend();
+        if (gpu_backend) {
+            ROS_INFO("GPU compute backend: %s", gpu_backend->name().c_str());
+        } else {
+            ROS_WARN("GPU backend creation failed, falling back to CPU");
+        }
+    }
+    #endif
+
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
     /*** debug record ***/
